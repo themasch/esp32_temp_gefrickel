@@ -1,5 +1,5 @@
 [package]
-name = "esp32_ds18b20"
+name = "esp32_temp_gefrickel"
 version = "0.1.0"
 edition = "2021"
 
