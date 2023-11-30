@@ -27,10 +27,10 @@ use esp32c3_hal::{
 };
 
 use esp_backtrace as _;
-use esp_println::{dbg, println};
+use esp_println::println;
 
 use ds18b20::{Ds18b20, Resolution};
-use one_wire_bus::OneWire;
+use one_wire_bus::{Address, OneWire};
 use ssd1351::{
     display::Display,
     interface::SpiInterface,
@@ -51,50 +51,79 @@ struct MeasurementResult<const S: usize> {
     results: [(u64, f32); S],
 }
 
-fn get_current_measurements<B, E, const S: usize>(
+impl<const S: usize> MeasurementResult<S> {
+    pub fn iter(&self) -> core::slice::Iter<'_, (u64, f32)> {
+        self.results[..self.result_count].iter()
+    }
+}
+
+struct DetectedSensors<const S: usize> {
+    count: usize,
+    addresses: [u64; S],
+}
+
+impl<const S: usize> DetectedSensors<S> {
+    pub fn iter(&self) -> core::slice::Iter<'_, u64> {
+        self.addresses[..self.count].iter()
+    }
+}
+
+fn discover_sensors<B, E: Debug, const S: usize>(
+    bus: &mut OneWire<B>,
+    delay: &mut Delay,
+) -> DetectedSensors<S>
+where
+    B: OutputPin<Error = E> + InputPin<Error = E>,
+{
+    let mut addresses = [0u64; S];
+    let mut count = 0;
+
+    for dev in bus.devices(false, delay) {
+        match dev {
+            Err(err) => {
+                println!("ERR: error while detecting connected devices: {:?}", err);
+            }
+            Ok(addr) => {
+                if addr.family_code() != ds18b20::FAMILY_CODE {
+                    continue;
+                }
+
+                addresses[count] = addr.0;
+                count += 1;
+            }
+        };
+    }
+
+    DetectedSensors { count, addresses }
+}
+
+fn read_temperatur_measurements<B, E: Debug, const S: usize>(
+    devices: DetectedSensors<S>,
     bus: &mut OneWire<B>,
     delay: &mut Delay,
 ) -> MeasurementResult<S>
 where
-    B: OutputPin<Error = E>,
-    B: InputPin<Error = E>,
-    E: Debug,
+    B: OutputPin<Error = E> + InputPin<Error = E>,
 {
-    let mut search_state = None;
     let mut count = 0;
     let mut results = [(0u64, 0.0f32); S];
-    loop {
-        let result = bus.device_search(search_state.as_ref(), false, delay);
 
-        if let Err(err) = result {
-            println!("ERR: {:?}", err);
-            break;
-        }
+    for &addr in devices.iter() {
+        let sensor = Ds18b20::new::<core::fmt::Error>(Address(addr))
+            .expect("could not create sensor device");
+        let sensor_data = sensor
+            .read_data(bus, delay)
+            .expect("could not read measurement");
 
-        if let Some((dev_addr, state)) = result.unwrap() {
-            search_state = Some(state);
-            if dev_addr.family_code() != ds18b20::FAMILY_CODE {
-                continue;
-            }
+        results[count] = (addr, sensor_data.temperature);
+        count += 1;
 
-            let sensor =
-                Ds18b20::new::<core::fmt::Error>(dev_addr).expect("could not create sensor device");
-
-            let sensor_data = sensor
-                .read_data(bus, delay)
-                .expect("could not read measurement");
-
-            results[count] = (dev_addr.0, sensor_data.temperature);
-            count += 1;
-            println!(
-                "{}: Device {:?} is at {}°C",
-                time(),
-                dev_addr,
-                sensor_data.temperature
-            );
-        } else {
-            break;
-        }
+        println!(
+            "{}: Device {:?} is at {}°C",
+            time(),
+            addr,
+            sensor_data.temperature
+        );
     }
 
     MeasurementResult {
@@ -129,14 +158,17 @@ fn main() -> ! {
     let system = periph.SYSTEM.split();
     let clocks = ClockControl::boot_defaults(system.clock_control).freeze();
     let io = IO::new(periph.GPIO, periph.IO_MUX);
-    let ow_data_pin = io.pins.gpio1.into_open_drain_output();
 
+    // the DC pin tells the SSD1351 controller wether the data coming in via SPI is a command or data
     let dc = io.pins.gpio2.into_push_pull_output();
 
     let din = io.pins.gpio6;
-    let miso = io.pins.gpio3;
     let sclk = io.pins.gpio8;
     let cs = io.pins.gpio7;
+
+    // we do not use MISO, since the display will never send us any data,
+    // so just use any free GPIO (sadly, it blocks a GPIO)
+    let miso = io.pins.gpio3;
 
     let spi = Spi::new(
         periph.SPI2,
@@ -144,13 +176,16 @@ fn main() -> ! {
         din,
         miso,
         cs,
-        12800u32.kHz(),
+        6400u32.kHz(),
         SpiMode::Mode0,
         &clocks,
     );
 
     let mut display = setup_display(spi, dc);
+
+    let ow_data_pin = io.pins.gpio1.into_open_drain_output();
     let mut bus = one_wire_bus::OneWire::new(ow_data_pin).expect("could not create bus");
+
     let mut delay = Delay::new(&clocks);
 
     let mut rtc = Rtc::new(periph.RTC_CNTL);
@@ -173,22 +208,22 @@ fn main() -> ! {
 
         println!("{}: measurement done", time());
 
-        let results: MeasurementResult<4> = get_current_measurements(&mut bus, &mut delay);
-        dbg!(&results);
+        let sensors: DetectedSensors<4> = discover_sensors(&mut bus, &mut delay);
+
+        let results = read_temperatur_measurements(sensors, &mut bus, &mut delay);
 
         display.clear();
-        let mut buffer = [0u8; 64];
-        for r in 0..results.result_count {
+
+        let mut buffer = [0u8; 24];
+        for (r, (_, temperatur)) in results.iter().enumerate() {
+            let pos = Point {
+                x: 2,
+                y: ((15 * r) + 15) as i32,
+            };
+
             Text::new(
-                format(
-                    &mut buffer,
-                    format_args!("Sensor {}: {}C", r, &results.results[r].1),
-                )
-                .unwrap(),
-                Point {
-                    x: 2,
-                    y: ((15 * r) + 15) as i32,
-                },
+                format(&mut buffer, format_args!("Sensor {}: {}C", r, temperatur)).unwrap(),
+                pos,
                 text_style,
             )
             .draw(&mut display)
