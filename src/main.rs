@@ -3,49 +3,38 @@
 
 use core::{fmt::Debug, time::Duration};
 
-use ds18b20::{Ds18b20, Resolution};
-use embedded_hal::{
-    blocking::delay::DelayMs,
-    digital::v2::{InputPin, OutputPin},
+use embedded_graphics::{
+    mono_font::{ascii::FONT_6X10, MonoTextStyleBuilder},
+    pixelcolor::Rgb565,
+    prelude::*,
+    text::Text,
 };
+use embedded_hal::digital::v2::{InputPin, OutputPin};
+
 use esp32c3_hal::{
-    self as hal,
-    clock::{ClockControl, Clocks},
+    clock::ClockControl,
     entry,
+    gpio::{GpioPin, Output, PushPull},
     peripherals::Peripherals,
     prelude::*,
-    reset::get_reset_reason,
     rtc_cntl::sleep::TimerWakeupSource,
-    spi::{master::Spi, SpiMode},
+    spi::{
+        master::{Instance, Spi},
+        FullDuplexMode, SpiMode,
+    },
     systimer::SystemTimer,
     Delay, Rtc, IO,
 };
+
 use esp_backtrace as _;
 use esp_println::{dbg, println};
-use hal::{
-    gpio::{GpioPin, Output, Pins, PushPull},
-    peripheral::Peripheral,
-    peripherals::SPI2,
-    reset::get_wakeup_cause,
-    rtc_cntl::SocResetReason,
-    spi::{master::Instance, FullDuplexMode},
-};
-use one_wire_bus::{OneWire, OneWireError};
 
+use ds18b20::{Ds18b20, Resolution};
+use one_wire_bus::OneWire;
 use ssd1351::{
     display::Display,
-    interface::{DisplayInterface, SpiInterface},
+    interface::SpiInterface,
     mode::{displaymode::DisplayMode, GraphicsMode, RawMode},
-};
-
-use embedded_graphics::{
-    mono_font::{
-        ascii::{FONT_6X10, FONT_9X18_BOLD},
-        MonoTextStyleBuilder,
-    },
-    pixelcolor::{BinaryColor, Rgb565},
-    prelude::*,
-    text::{Alignment, Text},
 };
 
 mod efmt;
@@ -114,10 +103,10 @@ where
     }
 }
 
-fn setup_display<'d, T: Instance, const DCN: u8>(
-    spi: Spi<'d, T, FullDuplexMode>,
+fn setup_display<T: Instance, const DCN: u8>(
+    spi: Spi<'_, T, FullDuplexMode>,
     dc: GpioPin<Output<PushPull>, DCN>,
-) -> GraphicsMode<SpiInterface<Spi<'d, T, FullDuplexMode>, GpioPin<Output<PushPull>, DCN>>>
+) -> GraphicsMode<SpiInterface<Spi<'_, T, FullDuplexMode>, GpioPin<Output<PushPull>, DCN>>>
 where
     GpioPin<Output<PushPull>, DCN>: OutputPin,
 {
@@ -173,10 +162,6 @@ fn main() -> ! {
 
     loop {
         println!("{} {} up and runnning!", time(), rtc.get_time_ms());
-        let reason = get_reset_reason().unwrap_or(SocResetReason::ChipPowerOn);
-        println!("reset reason: {:?}", reason);
-        let wake_reason = get_wakeup_cause();
-        println!("wake reason: {:?}", wake_reason);
 
         let timer = TimerWakeupSource::new(Duration::from_secs(2));
 
@@ -206,7 +191,8 @@ fn main() -> ! {
                 },
                 text_style,
             )
-            .draw(&mut display).expect("could not render text to display");
+            .draw(&mut display)
+            .expect("could not render text to display");
         }
 
         println!("{}: sleeping", time());
